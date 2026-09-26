@@ -78,8 +78,9 @@ class Trainer:
         # Move model to device
         self.model = self.model.to(self.device)
 
-        # Mixed precision scaler
-        self.scaler = GradScaler(enabled=enable_mixed_precision)
+        # Mixed precision: fp16 needs loss scaling, bf16 does not
+        self.amp_dtype = torch.float16 if self.device.type == "cuda" else torch.bfloat16
+        self.scaler = GradScaler(enabled=enable_mixed_precision and self.amp_dtype == torch.float16)
 
         # Metrics
         self.metrics = MetricsTracker()
@@ -136,52 +137,33 @@ class Trainer:
             input_ids = input_ids.to(self.device)
             labels = labels.to(self.device)
 
-            # Forward pass
-            logits, loss = self.model(
-                input_ids=input_ids,
-                labels=labels,
-                return_loss=True,
+            # Forward pass (autocast when mixed precision is on: fp16 on CUDA, bf16 on CPU)
+            with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.enable_mixed_precision):
+                logits, loss = self.model(input_ids=input_ids, labels=labels, return_loss=True)
+
+            # Backward on the scaled loss (the scaler is a no-op for bf16/fp32)
+            self.scaler.scale_loss(loss).backward()
+
+            # Data parallel: average gradients across ranks before touching them
+            if hasattr(self.model, "synchronize_gradients"):
+                self.model.synchronize_gradients()
+
+            # Unscale before clipping and stepping, then skip the step on overflow
+            self.scaler.unscale_grads(self.optimizer)
+            overflow = self.scaler.enabled and self.scaler.has_overflow(
+                [p.grad for p in self.model.parameters() if p.grad is not None]
             )
-
-            # Scale loss if using mixed precision
-            if self.enable_mixed_precision:
-                scaled_loss = self.scaler.scale_loss(loss)
+            if overflow:
+                self.scaler.step(self.optimizer, overflow=True)  # lowers the scale, drops these grads
             else:
-                scaled_loss = loss
-
-            # Backward pass
-            scaled_loss.backward()
-
-            # Check for overflow
-            if self.enable_mixed_precision:
-                overflow = self.scaler.has_overflow(
-                    [p.grad for p in self.model.parameters()]
-                )
-            else:
-                overflow = False
-
-            if not overflow:
-                # Gradient clipping
                 if self.gradient_clip_norm > 0:
-                    nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.gradient_clip_norm,
-                    )
-
-                # Optimizer step
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
                 self.optimizer.step()
-
-                # Update loss scale
-                if self.enable_mixed_precision:
-                    self.scaler.step(self.optimizer, overflow=False)
-
-                # Learning rate step
+                self.scaler.step(self.optimizer, overflow=False)
                 if self.scheduler is not None:
                     self.scheduler.step()
-
                 self.global_step += 1
 
-            # Zero gradients
             self.optimizer.zero_grad()
 
             # Metrics

@@ -1,150 +1,72 @@
 """
-Data Parallelism
+Data parallelism: every rank holds the whole model and a slice of the batch.
 
-Each GPU holds a complete model copy. Batch is split across GPUs.
-Gradients are synchronized after backward pass.
+After backward, gradients are averaged across ranks in buckets of about `bucket_mb` megabytes
+(fewer, larger messages), using either the hand-written ring all-reduce or the backend's
+all-reduce. Parameters are broadcast from rank 0 at construction so all replicas start equal.
 """
 
+from contextlib import contextmanager
+from typing import Iterator, List
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from typing import Optional
-from tinytrain.distributed.comm import (
-    is_distributed,
-    allreduce,
-    get_world_size,
-    get_rank,
-)
+
+from tinytrain.distributed.comm import get_world_size, is_distributed
+from tinytrain.distributed.ring_allreduce import ring_allreduce
 
 
 class DataParallel(nn.Module):
-    """
-    Data parallel wrapper for models.
-
-    Synchronizes gradients across all ranks using all-reduce
-    after the backward pass. Supports gradient accumulation.
-
-    Args:
-        module: The model to wrap
-        sync_gradients: Whether to synchronize gradients across ranks
-        bucket_size_mb: Gradient bucketing size for communication efficiency
-    """
-
-    def __init__(
-        self,
-        module: nn.Module,
-        sync_gradients: bool = True,
-        bucket_size_mb: int = 25,
-    ) -> None:
+    def __init__(self, module: nn.Module, bucket_mb: float = 25.0, use_ring: bool = True) -> None:
         super().__init__()
-
         self.module = module
-        self.sync_gradients = sync_gradients
-        self.bucket_size_mb = bucket_size_mb
+        self.bucket_bytes = int(bucket_mb * 2 ** 20)
+        self.use_ring = use_ring
         self.world_size = get_world_size() if is_distributed() else 1
-
-        # For gradient accumulation
-        self.accumulated_grads = 0
-        self.accumulation_steps = 1
+        self._sync = True
+        if self.world_size > 1:
+            with torch.no_grad():
+                for p in self.module.state_dict().values():
+                    dist.broadcast(p, src=0)
 
     def forward(self, *args, **kwargs):
-        """Forward pass (delegates to wrapped module)."""
         return self.module(*args, **kwargs)
 
+    @contextmanager
+    def no_sync(self) -> Iterator[None]:
+        """Skip gradient sync (for gradient accumulation); sync on the last micro-step."""
+        self._sync = False
+        try:
+            yield
+        finally:
+            self._sync = True
+
+    def _buckets(self) -> List[List[torch.Tensor]]:
+        buckets, current, size = [], [], 0
+        # Reverse order: the last layers' gradients are ready first in a real overlap schedule.
+        for p in reversed([p for p in self.module.parameters() if p.grad is not None]):
+            current.append(p.grad)
+            size += p.grad.numel() * p.grad.element_size()
+            if size >= self.bucket_bytes:
+                buckets.append(current)
+                current, size = [], 0
+        if current:
+            buckets.append(current)
+        return buckets
+
+    @torch.no_grad()
     def synchronize_gradients(self) -> None:
-        """
-        Synchronize gradients across all ranks using all-reduce.
-
-        This should be called after backward() to ensure all GPUs
-        have the same gradient values.
-        """
-        if not self.sync_gradients or self.world_size == 1:
+        if not self._sync or self.world_size == 1:
             return
-
-        # Bucket gradients for communication efficiency
-        self._allreduce_gradients()
-
-    def _allreduce_gradients(self) -> None:
-        """All-reduce gradients across all ranks."""
-        world_size = self.world_size
-
-        # Collect all gradients
-        grads = []
-        for param in self.module.parameters():
-            if param.grad is not None:
-                grads.append(param.grad.data.flatten())
-
-        if not grads:
-            return
-
-        # Concatenate all gradients
-        all_grads = torch.cat(grads)
-
-        # All-reduce
-        allreduce(all_grads, op="sum")
-
-        # Average
-        all_grads.div_(world_size)
-
-        # Distribute back to parameters
-        offset = 0
-        for param in self.module.parameters():
-            if param.grad is not None:
-                numel = param.grad.numel()
-                param.grad.data = all_grads[offset : offset + numel].view_as(
-                    param.grad.data
-                )
-                offset += numel
-
-    def set_gradient_accumulation_steps(self, steps: int) -> None:
-        """
-        Set number of accumulation steps.
-
-        Gradients will only be synchronized after this many backward passes.
-
-        Args:
-            steps: Number of accumulation steps
-        """
-        self.accumulation_steps = steps
-
-    def should_sync_gradients(self) -> bool:
-        """
-        Check if gradients should be synchronized now.
-
-        Used for gradient accumulation: only sync every N backward passes.
-
-        Returns:
-            True if should synchronize
-        """
-        self.accumulated_grads += 1
-        should_sync = self.accumulated_grads % self.accumulation_steps == 0
-
-        if should_sync:
-            self.accumulated_grads = 0
-
-        return should_sync
-
-    def zero_grad(self) -> None:
-        """Zero gradients."""
-        self.module.zero_grad()
-
-    def parameters(self):
-        """Get module parameters."""
-        return self.module.parameters()
-
-    def state_dict(self):
-        """Get module state dict."""
-        return self.module.state_dict()
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Load module state dict."""
-        return self.module.load_state_dict(state_dict, strict=strict)
-
-    def train(self, mode=True):
-        """Set train mode."""
-        self.module.train(mode)
-        return self
-
-    def eval(self):
-        """Set eval mode."""
-        self.module.eval()
-        return self
+        for bucket in self._buckets():
+            flat = torch.cat([g.reshape(-1) for g in bucket])
+            if self.use_ring:
+                ring_allreduce(flat, op="avg")
+            else:
+                dist.all_reduce(flat)
+                flat /= self.world_size
+            offset = 0
+            for g in bucket:
+                g.copy_(flat[offset:offset + g.numel()].view_as(g))
+                offset += g.numel()

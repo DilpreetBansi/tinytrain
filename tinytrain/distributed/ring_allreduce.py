@@ -1,154 +1,69 @@
 """
-Ring AllReduce Algorithm
+Ring all-reduce built from point-to-point send/recv.
 
-Efficient all-reduce implementation for multi-node training.
-Bandwidth optimal: O(2(N-1)/N) ≈ O(2) regardless of machine count.
+The flat buffer is split into N equal chunks (padded). Two phases of N-1 steps each:
 
-Algorithm:
-1. Scatter-reduce phase (N-1 steps): Each rank sends/receives a chunk
-2. AllGather phase (N-1 steps): Broadcast the reduced chunks to all ranks
+  reduce-scatter: at step s, rank r sends chunk (r - s) to r+1 and adds the chunk it receives,
+                  (r - s - 1), from r-1. Afterwards rank r holds the full sum of chunk (r + 1).
+  all-gather:     at step s, rank r sends chunk (r + 1 - s) to r+1 and overwrites chunk (r - s)
+                  with what it receives from r-1. Afterwards every rank holds every summed chunk.
+
+Each rank sends 2 (N-1)/N of the data in total, independent of N, which is why the ring is
+bandwidth-optimal.
 """
+
+from typing import List
 
 import torch
 import torch.distributed as dist
-from typing import List, Tuple
-from tinytrain.distributed.comm import is_distributed, get_rank, get_world_size
+
+from tinytrain.distributed.comm import get_rank, get_world_size, is_distributed
 
 
-def ring_allreduce(
-    tensors: List[torch.Tensor],
-    world_size: int = None,
-    rank: int = None,
-) -> List[torch.Tensor]:
-    """
-    Perform all-reduce using ring algorithm.
-
-    Args:
-        tensors: List of tensors to reduce (modified in-place)
-        world_size: Total number of ranks (auto-detected if None)
-        rank: Current rank (auto-detected if None)
-
-    Returns:
-        List of reduced tensors (same as input, modified in-place)
-    """
-    if not is_distributed():
-        return tensors
-
-    if world_size is None:
-        world_size = get_world_size()
-
-    if rank is None:
-        rank = get_rank()
-
-    if world_size == 1:
-        return tensors
-
-    # Flatten all tensors into single tensor for easier manipulation
-    total_numel = sum(t.numel() for t in tensors)
-    device = tensors[0].device
-    dtype = tensors[0].dtype
-
-    # Create flattened buffer
-    flat_tensor = torch.zeros(total_numel, device=device, dtype=dtype)
-
-    # Copy tensors into flat buffer
-    offset = 0
-    for t in tensors:
-        flat_tensor[offset : offset + t.numel()] = t.flatten()
-        offset += t.numel()
-
-    # Divide into N chunks
-    chunk_size = (total_numel + world_size - 1) // world_size
-    chunks = []
-
-    for i in range(world_size):
-        start = i * chunk_size
-        end = min(start + chunk_size, total_numel)
-        chunk = flat_tensor[start:end].clone()
-        chunks.append(chunk)
-
-    # Scatter-reduce phase: N-1 steps
-    for step in range(world_size - 1):
-        # Send to next rank, receive from previous rank
-        send_chunk = chunks[(rank - step) % world_size]
-        recv_chunk = chunks[(rank - step - 1) % world_size]
-
-        send_buffer = send_chunk.clone()
-        recv_buffer = torch.zeros_like(recv_chunk)
-
-        # Non-blocking send/receive for better pipelining
-        send_req = dist.isend(send_buffer, (rank + 1) % world_size)
-        recv_req = dist.irecv(recv_buffer, (rank - 1) % world_size)
-
-        send_req.wait()
-        recv_req.wait()
-
-        # Add received chunk to the chunk that needs reduction
-        chunks[(rank - step - 1) % world_size] += recv_buffer
-
-    # AllGather phase: N-1 steps
-    for step in range(world_size - 1):
-        # Send to next rank, receive from previous rank
-        send_chunk = chunks[(rank - step) % world_size]
-        recv_chunk = chunks[(rank - step - 1) % world_size]
-
-        send_buffer = send_chunk.clone()
-        recv_buffer = torch.zeros_like(recv_chunk)
-
-        # Non-blocking send/receive
-        send_req = dist.isend(send_buffer, (rank + 1) % world_size)
-        recv_req = dist.irecv(recv_buffer, (rank - 1) % world_size)
-
-        send_req.wait()
-        recv_req.wait()
-
-        chunks[(rank - step - 1) % world_size] = recv_buffer
-
-    # Reconstruct flattened tensor from chunks
-    for i, chunk in enumerate(chunks):
-        start = i * chunk_size
-        end = min(start + chunk_size, total_numel)
-        flat_tensor[start:end] = chunk[: end - start]
-
-    # Copy back to original tensors
-    offset = 0
-    for t in tensors:
-        t.copy_(flat_tensor[offset : offset + t.numel()].view_as(t))
-        offset += t.numel()
-
-    return tensors
+def _exchange(send: torch.Tensor, recv: torch.Tensor, rank: int, world: int) -> None:
+    ops = [dist.P2POp(dist.isend, send, (rank + 1) % world), dist.P2POp(dist.irecv, recv, (rank - 1) % world)]
+    for req in dist.batch_isend_irecv(ops):
+        req.wait()
 
 
-def ring_allreduce_optimized(
-    tensor: torch.Tensor,
-    op: str = "sum",
-) -> torch.Tensor:
-    """
-    Optimized ring all-reduce with better locality.
-
-    Uses pre-allocated buffers and minimal copies.
-
-    Args:
-        tensor: Tensor to reduce (modified in-place)
-        op: Reduction operation ("sum")
-
-    Returns:
-        Reduced tensor (modified in-place)
-    """
-    if not is_distributed():
+@torch.no_grad()
+def ring_allreduce(tensor: torch.Tensor, op: str = "sum") -> torch.Tensor:
+    """In-place all-reduce (sum or avg) of one tensor over the default process group."""
+    if op not in ("sum", "avg"):
+        raise ValueError(f"unsupported op {op!r}")
+    if not is_distributed() or get_world_size() == 1:
         return tensor
+    world, rank = get_world_size(), get_rank()
 
-    world_size = get_world_size()
-    rank = get_rank()
+    flat = tensor.detach().reshape(-1)
+    n = flat.numel()
+    chunk = (n + world - 1) // world
+    buf = torch.zeros(chunk * world, dtype=flat.dtype, device=flat.device)
+    buf[:n] = flat
+    chunks = list(buf.view(world, chunk))
+    recv = torch.empty(chunk, dtype=flat.dtype, device=flat.device)
 
-    if world_size == 1:
-        return tensor
+    for s in range(world - 1):                       # reduce-scatter
+        _exchange(chunks[(rank - s) % world].clone(), recv, rank, world)
+        chunks[(rank - s - 1) % world] += recv
+    for s in range(world - 1):                       # all-gather
+        _exchange(chunks[(rank + 1 - s) % world].clone(), recv, rank, world)
+        chunks[(rank - s) % world].copy_(recv)
 
-    # For simplicity, fall back to standard allreduce from torch.distributed
-    # In production, would implement full ring allreduce with explicit communication
-    if op == "sum":
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    else:
-        raise ValueError(f"Unsupported operation: {op}")
-
+    if op == "avg":
+        buf /= world
+    tensor.copy_(buf[:n].view_as(tensor))
     return tensor
+
+
+def ring_allreduce_coalesced(tensors: List[torch.Tensor], op: str = "sum") -> List[torch.Tensor]:
+    """All-reduce several tensors with one ring pass over a single flat buffer."""
+    if not tensors or not is_distributed() or get_world_size() == 1:
+        return tensors
+    flat = torch.cat([t.detach().reshape(-1) for t in tensors])
+    ring_allreduce(flat, op)
+    offset = 0
+    for t in tensors:
+        t.copy_(flat[offset:offset + t.numel()].view_as(t))
+        offset += t.numel()
+    return tensors

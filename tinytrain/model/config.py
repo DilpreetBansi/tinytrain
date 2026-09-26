@@ -156,11 +156,11 @@ class GPTConfig:
         pos_emb = self.max_seq_len * self.d_model
 
         # Per transformer block:
-        # - Self-attention: 3*d_model^2 + 3*d_model (Q,K,V projections + output proj)
+        # - Self-attention: 4*d_model^2 + 4*d_model (Q, K, V and output projections)
         # - MLP: d_model*d_ff + d_ff + d_ff*d_model + d_model
         # - LayerNorms: 4*d_model (2 per block)
         per_block = (
-            3 * self.d_model * self.d_model + 3 * self.d_model +  # attention
+            4 * self.d_model * self.d_model + 4 * self.d_model +  # attention (Q, K, V, output)
             self.d_model * self.d_ff + self.d_ff + self.d_ff * self.d_model + self.d_model +  # MLP
             4 * self.d_model  # LayerNorms
         )

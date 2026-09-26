@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      GLOO_SOCKET_IFNAME: lo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
+      - name: Unit + multi-process tests (gloo on CPU)
+        run: pytest -q
+      - name: Short 2-rank training runs
+        run: |
+          python scripts/train_parallel.py --strategy single --steps 20
+          torchrun --nproc_per_node=2 scripts/train_parallel.py --strategy dp --steps 20
+          torchrun --nproc_per_node=2 scripts/train_parallel.py --strategy tp --steps 20
+          torchrun --nproc_per_node=2 scripts/train_parallel.py --strategy pp --steps 20

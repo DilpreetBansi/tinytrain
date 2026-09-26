@@ -1,42 +1,19 @@
-"""
-TinyTrain: Distributed LLM Training Framework
-Setup script for pip installation.
-"""
+from setuptools import find_packages, setup
 
-from setuptools import setup, find_packages
-
-with open("README.md", "r", encoding="utf-8") as fh:
+with open("README.md", encoding="utf-8") as fh:
     long_description = fh.read()
-
-with open("requirements.txt", "r", encoding="utf-8") as fh:
-    requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
 setup(
     name="tinytrain",
-    version="0.1.0",
-    author="TinyTrain Contributors",
-    description="A distributed LLM training framework from scratch",
+    version="0.2.0",
+    author="Dilpreet Singh Bansi",
+    description="Data, tensor and pipeline parallelism for GPT training, built on torch.distributed",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/DilpreetBansi/tinytrain",
-    packages=find_packages(),
-    classifiers=[
-        "Development Status :: 3 - Alpha",
-        "Intended Audience :: Developers",
-        "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    ],
-    python_requires=">=3.8",
-    install_requires=requirements,
-    entry_points={
-        "console_scripts": [
-            "tinytrain-train=tinytrain.scripts.train_single_gpu:main",
-        ],
-    },
+    packages=find_packages(exclude=["tests", "tests.*"]),
+    python_requires=">=3.10",
+    install_requires=["torch>=2.1", "numpy>=1.24"],
+    extras_require={"dev": ["pytest>=7.4", "matplotlib>=3.7"]},
+    classifiers=["Programming Language :: Python :: 3", "License :: OSI Approved :: MIT License"],
 )

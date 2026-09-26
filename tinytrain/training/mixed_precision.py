@@ -6,7 +6,6 @@ Reduces memory usage and increases training speed while maintaining accuracy.
 """
 
 import torch
-from torch.cuda.amp import GradScaler as TorchGradScaler
 from typing import Optional
 
 
